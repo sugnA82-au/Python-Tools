@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""
+# -- File Hashing System -- 
+# - This Python script Generates BLAKE2b hashes for all files in a defined dir and stores them in a sqlite database
+# - Define dir in #Configuration & "def setup_logging():"
+# - V3 02/06/2025
+"""
+
+import os
+import sqlite3
+import hashlib
+import argparse
+from pathlib import Path
+from datetime import datetime
+import logging
+import time
+import sys
+
+# Configuration
+BACKUP_PATH = "/mnt/xx"
+DATABASE_PATH = "/mnt/xx/file_hashes.db"
+CHUNK_SIZE = 65536  # 64KB chunks for memory efficiency
+
+def setup_logging():
+    """Setup logging configuration"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('/mnt/xx/hash_process.log'),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
+
+def create_database():
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS file_hashes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT UNIQUE NOT NULL,
+                blake2b_hash TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                last_modified REAL NOT NULL,
+                hash_created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON file_hashes(file_path)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_blake2b_hash ON file_hashes(blake2b_hash)")
+        conn.commit()
+
+def calculate_blake2b(file_path):
+    """Calculate BLAKE2b hash for a file"""
+    hasher = hashlib.blake2b()
+    
+    try:
+        with open(file_path, 'rb') as f:
+            while chunk := f.read(CHUNK_SIZE):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except (IOError, OSError) as e:
+        raise Exception(f"Error reading file {file_path}: {e}")
+
+def get_file_info(file_path):
+    """Get file size and modification time"""
+    stat = os.stat(file_path)
+    return stat.st_size, stat.st_mtime
+
+def file_needs_hashing(cursor, file_path, file_size, last_modified):
+    """Check if file needs to be hashed (new or modified)"""
+    cursor.execute(
+        'SELECT file_size, last_modified FROM file_hashes WHERE file_path = ?',
+        (str(file_path),)
+    )
+    result = cursor.fetchone()
+    
+    if result is None:
+        return True  # New file
+    
+    stored_size, stored_mtime = result
+    return file_size != stored_size or abs(last_modified - stored_mtime) > 1
+
+def update_hash_record(cursor, file_path, blake2b_hash, file_size, last_modified):
+    """Insert or update hash record in database"""
+    cursor.execute('''
+        INSERT OR REPLACE INTO file_hashes 
+        (file_path, blake2b_hash, file_size, last_modified, hash_created)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (str(file_path), blake2b_hash, file_size, last_modified, datetime.now()))
+
+def format_bytes(bytes_val):
+    """Format bytes into human readable format"""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_val < 1024.0:
+            return f"{bytes_val:.2f} {unit}"
+        bytes_val /= 1024.0
+    return f"{bytes_val:.2f} PB"
+
+def format_time(seconds):
+    """Format seconds into human readable format"""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        return f"{int(seconds//60)}m {int(seconds%60)}s"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        return f"{hours}h {minutes}m"
+
+def count_total_files(backup_path, file_extensions=None):
+    """Count total files to process for progress tracking"""
+    total = 0
+    print("Counting files to process...")
+    for root, dirs, files in os.walk(backup_path):
+        for file in files:
+            if file_extensions:
+                file_path = Path(root) / file
+                if file_path.suffix.lower() not in file_extensions:
+                    continue
+            total += 1
+        if total % 10000 == 0 and total > 0:
+            print(f"Found {total:,} files so far...")
+    return total
+
+def process_files(backup_path, skip_existing=True, file_extensions=None):
+    """Process all files in the backup directory"""
+    logger = logging.getLogger(__name__)
+    
+    # Create database
+    create_database()
+    
+    # Connect to database
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    # Counters and timing
+    processed = 0
+    skipped = 0
+    errors = 0
+    total_bytes_processed = 0
+    start_time = time.time()
+    last_progress_time = start_time
+    
+    # Count total files for progress tracking
+    total_files = count_total_files(backup_path, file_extensions)
+    print(f"Found {total_files:,} files to process\n")
+    
+    try:
+        # Walk through all files
+        for root, dirs, files in os.walk(backup_path):
+            for file in files:
+                file_path = Path(root) / file
+                current_total = processed + skipped + errors
+                
+                # Filter by extensions if specified
+                if file_extensions and file_path.suffix.lower() not in file_extensions:
+                    continue
+                
+                try:
+                    # Get file info
+                    file_size, last_modified = get_file_info(file_path)
+                    
+                    # Check if we need to hash this file
+                    if skip_existing and not file_needs_hashing(cursor, file_path, file_size, last_modified):
+                        skipped += 1
+                        # Progress update for skipped files
+                        if (processed + skipped) % 50 == 0 or time.time() - last_progress_time > 5:
+                            current_total = processed + skipped + errors
+                            progress_pct = (current_total / total_files * 100) if total_files > 0 else 0
+                            elapsed = time.time() - start_time
+                            rate = current_total / elapsed if elapsed > 0 else 0
+                            
+                            print(f"\rProgress: {current_total:,}/{total_files:,} ({progress_pct:.1f}%) | "
+                                  f"Rate: {rate:.1f} files/sec | "
+                                  f"Processed: {processed:,} | Skipped: {skipped:,} | Errors: {errors:,}", 
+                                  end='', flush=True)
+                            last_progress_time = time.time()
+                        continue
+                    
+                    # Calculate hash with timing
+                    hash_start = time.time()
+                    blake2b_hash = calculate_blake2b(file_path)
+                    hash_time = time.time() - hash_start
+                    
+                    # Store in database
+                    update_hash_record(cursor, file_path, blake2b_hash, file_size, last_modified)
+                    
+                    processed += 1
+                    total_bytes_processed += file_size
+                    
+                    # Calculate speeds
+                    elapsed = time.time() - start_time
+                    avg_speed_files = processed / elapsed if elapsed > 0 else 0
+                    avg_speed_bytes = total_bytes_processed / elapsed if elapsed > 0 else 0
+                    file_speed_bytes = file_size / hash_time if hash_time > 0 else 0
+                    
+                    # Progress update
+                    if processed % 10 == 0 or time.time() - last_progress_time > 2:
+                        current_total = processed + skipped + errors
+                        progress_pct = (current_total / total_files * 100) if total_files > 0 else 0
+                        
+                        # Estimate time remaining
+                        if avg_speed_files > 0 and total_files > current_total:
+                            eta_seconds = (total_files - current_total) / avg_speed_files
+                            eta_str = f" | ETA: {format_time(eta_seconds)}"
+                        else:
+                            eta_str = ""
+                        
+                        print(f"\rProgress: {current_total:,}/{total_files:,} ({progress_pct:.1f}%) | "
+                              f"Speed: {avg_speed_files:.1f} files/sec, {format_bytes(avg_speed_bytes)}/sec | "
+                              f"Processed: {processed:,} | Skipped: {skipped:,}{eta_str}", 
+                              end='', flush=True)
+                        last_progress_time = time.time()
+                    
+                    # Detailed logging for individual files
+                    if file_size > 100 * 1024 * 1024:  # Log files > 100MB
+                        logger.info(f"Hashed large file: {file_path} ({format_bytes(file_size)}) "
+                                   f"at {format_bytes(file_speed_bytes)}/sec")
+                    
+                    # Commit periodically
+                    if processed % 100 == 0:
+                        conn.commit()
+                
+                except Exception as e:
+                    logger.error(f"Error processing {file_path}: {e}")
+                    errors += 1
+                    continue
+        
+        # Final commit and summary
+        conn.commit()
+        
+        total_time = time.time() - start_time
+        final_total = processed + skipped + errors
+        
+        print(f"\n\n=== COMPLETION SUMMARY ===")
+        print(f"Total files examined: {final_total:,}")
+        print(f"Files processed (hashed): {processed:,}")
+        print(f"Files skipped (unchanged): {skipped:,}")
+        print(f"Errors: {errors:,}")
+        print(f"Total data processed: {format_bytes(total_bytes_processed)}")
+        print(f"Total time: {format_time(total_time)}")
+        print(f"Average speed: {processed/total_time:.1f} files/sec, {format_bytes(total_bytes_processed/total_time)}/sec")
+        
+        logger.info(f"Complete! Processed: {processed:,}, Skipped: {skipped:,}, Errors: {errors:,}, "
+                   f"Time: {format_time(total_time)}, Speed: {format_bytes(total_bytes_processed/total_time)}/sec")
+        
+    finally:
+        conn.close()
+
+def find_duplicates():
+    """Find duplicate files based on BLAKE2b hashes"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT blake2b_hash, COUNT(*) as count, 
+               GROUP_CONCAT(file_path) as file_paths
+        FROM file_hashes 
+        GROUP BY blake2b_hash 
+        HAVING COUNT(*) > 1
+        ORDER BY count DESC
+    ''')
+    
+    duplicates = cursor.fetchall()
+    conn.close()
+    
+    return duplicates
+
+def get_stats():
+    """Get database statistics"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT COUNT(*) FROM file_hashes')
+    total_files = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(DISTINCT blake2b_hash) FROM file_hashes')
+    unique_hashes = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT SUM(file_size) FROM file_hashes')
+    total_size = cursor.fetchone()[0] or 0
+    
+    conn.close()
+    
+    return {
+        'total_files': total_files,
+        'unique_hashes': unique_hashes,
+        'duplicates': total_files - unique_hashes,
+        'total_size_bytes': total_size,
+        'total_size_gb': total_size / (1024**3)
+    }
+
+def main():
+    parser = argparse.ArgumentParser(description='Generate BLAKE2b hashes for all files')
+    parser.add_argument('--backup-path', default=BACKUP_PATH, 
+                       help='Path to backup directory')
+    parser.add_argument('--force', action='store_true',
+                       help='Rehash all files, even if unchanged')
+    parser.add_argument('--extensions', nargs='+',
+                       help='Only process files with these extensions')
+    parser.add_argument('--find-duplicates', action='store_true',
+                       help='Find and display duplicate files')
+    parser.add_argument('--stats', action='store_true',
+                       help='Show database statistics')
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    logger = setup_logging()
+    
+    if args.stats:
+        stats = get_stats()
+        print(f"Database Statistics:")
+        print(f"  Total files: {stats['total_files']:,}")
+        print(f"  Unique hashes: {stats['unique_hashes']:,}")
+        print(f"  Duplicate files: {stats['duplicates']:,}")
+        print(f"  Total size: {stats['total_size_gb']:.2f} GB")
+        return
+    
+    if args.find_duplicates:
+        logger.info("Finding duplicate files...")
+        duplicates = find_duplicates()
+        
+        if duplicates:
+            print(f"Found {len(duplicates)} sets of duplicate files:")
+            for hash_val, count, paths in duplicates:
+                print(f"\nHash: {hash_val}")
+                print(f"Count: {count}")
+                for path in paths.split(','):
+                    print(f"  {path}")
+        else:
+            print("No duplicate files found.")
+        return
+    
+    # Process files
+    logger.info(f"Starting hash processing for: {args.backup_path}")
+    extensions = [ext.lower() if ext.startswith('.') else f'.{ext.lower()}' 
+                 for ext in args.extensions] if args.extensions else None
+    
+    process_files(
+        backup_path=args.backup_path,
+        skip_existing=not args.force,
+        file_extensions=extensions
+    )
+
+if __name__ == "__main__":
+    main()
