@@ -1,7 +1,7 @@
 # Python-Tools
 
-# Tools written in python to automate or simplify complex tasks on Linux servers.
+# Tools written in python to automate or simplify complex tasks
 
 #Tool/s
 
-#File Hasher written in Python for hasing files in a dir for later hash-checking upon migration or backup
+#File Hasher written in Python for data integrity checking
